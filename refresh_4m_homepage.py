@@ -24,21 +24,30 @@ Management_v0_YYMMDD.xlsx)을 받아서 아래를 자동으로 생성한다.
 
 사용법
 ------
-    python refresh_4m_homepage.py "<백업최신.xlsx>" \
-        --m4-file "<VS협력사변경관리팀 업무 관리_v0.xlsx>" [--outdir output]
+  [A] 팀즈에서 직접 다운로드 (코드가 최신 파일을 내려받아 실행)
+      # Microsoft Graph 액세스 토큰 필요 (환경변수 GRAPH_TOKEN)
+      GRAPH_TOKEN="<access_token>" python refresh_4m_homepage.py --download [--outdir output]
+      → 위 두 링크에서 최신 List 파일과 업무 관리(4M) 파일을 outdir 로 내려받고,
+        그 최신 파일 기준으로 HTML·엑셀을 생성한다. 받은 원본 파일도 outdir 에 함께 저장된다.
 
-    # 4M 시트가 입력 파일 안에 함께 있으면 --m4-file 생략 가능
-    python refresh_4m_homepage.py "<입력.xlsx>" [--outdir output]
+  [B] 로컬 파일로 실행 (이미 받아둔 파일 사용)
+      python refresh_4m_homepage.py "<백업최신.xlsx>" \
+          --m4-file "<VS협력사변경관리팀 업무 관리_v0.xlsx>" [--outdir output]
 
-매주 금요일 자동화(이 플랫폼의 예약 작업)에서는:
-    팀즈 백업 폴더의 최신 파일과 업무 관리 파일을 내려받은 뒤 위 명령으로 실행하여
-    output 폴더(OneDrive Cowork)에 HTML·엑셀을 새로 저장한다.
+산출물(outdir): ① 최신 List 원본  ② 최신 4M(업무관리) 원본  ③ Summary_정기비정기.xlsx  ④ 홈페이지 HTML
+
+인증 안내
+--------
+  표준 Python 으로 SharePoint 에 접속하려면 인증(Graph 토큰)이 반드시 필요하다.
+  · 토큰을 직접 발급/주입할 수 있는 환경: --download 로 코드가 스스로 다운로드한다.
+  · 이 Cowork 플랫폼: 매주 금요일 예약 작업이 토큰 없이 자동으로 최신 파일을 받아 이 코드를 실행한다.
+  · 토큰이 없으면 --download 는 안내 메시지를 출력하고 종료한다. ([B] 로컬 모드로 대체 가능)
 
 ※ 정적 HTML 자체는 보안 인증이 걸린 SharePoint 에 스스로 접속/갱신할 수 없으므로,
   "주간 자동 최신화"는 이 스크립트를 주기 실행하는 예약 작업으로 구현한다.
 """
 
-import sys, os, re, json, base64, html, argparse, datetime, subprocess
+import sys, os, re, json, base64, html, argparse, datetime, subprocess, glob
 import openpyxl
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -46,11 +55,117 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # 진행 단계 표준 순서 / 정기·비정기 분해를 붙일 단계(원본 C·E·G)
 CANON_STAGES = ['4M 완료', '심의회', 'Reject', 'QA 인정 시험', '4M 완료(C)', 'GQMS 접수']
 BREAKDOWN_STAGES = ['심의회', 'QA 인정 시험', 'GQMS 접수']   # 홈 화면에 노출 + 정기/비정기 분해
+# 정기/비정기 값별 그래프 색상 (요구사항 지정)
+PERIOD_COLORS = {
+    '23년 비정기': '#E53935',       # Red
+    '24년 비정기': '#E53935',       # Red
+    '25년 상반기 정기': '#FB8C00',  # Orange
+    '25년 하반기 정기': '#FDD835',  # Yellow
+    '25년 비정기': '#FB8C00',       # Orange
+    '26년 비정기': '#43A047',       # Green
+    '26년 상반기 정기': '#43A047',  # Green
+}
+PERIOD_COLOR_DEFAULT = '#9aa0a6'
 # 홈 화면에서 제외할 단독 열: 분해 없는 단계 + 합계(=요청: B·K·T·AC)
 # List 화면에 노출할 핵심 컬럼(전체 컬럼은 내장 엑셀에서 확인)
 LIST_KEEP = ['ChM','Req. No','정기/비정기','요청 주체','진행 단계','OEM','Project','Supplier','Part No',
  'Item Desc','CMDT','변경점','변경 사유','4M 등급','Risk','이슈','해결방안','비고','GQMS 접수',
  '1차 심의회','4M 완료 목표일','4M 완료일','진행율','Status','심의회']
+
+# ============================ 팀즈(SharePoint) 데이터 출처 ============================
+# 코드를 --download 로 실행하면 아래 두 링크에서 최신 파일을 직접 내려받는다.
+#   - List/Summary : '999. 백업' 폴더 → 최신 'Supplier Parts Change Management_v0_YYMMDD.xlsx'
+#   - 4M Issue 보고 : '04. Meeting' 폴더 → 'VS협력사변경관리팀 업무 관리_v0.xlsx' 의 '4M_Issue_보고' 시트
+BACKUP_FOLDER_SHARE_URL = ('https://lgeteams.sharepoint.com/:f:/r/sites/O365_379639/Shared%20Documents/'
+    'VS%ED%98%91%EB%A0%A5%EC%82%AC%EB%B3%80%EA%B2%BD%EA%B4%80%EB%A6%AC%ED%8C%80/'
+    '06.%20Parts%20Change%20Management%20(4M)/%EB%B6%80%ED%92%88%204M%20%ED%98%84%ED%99%A9/'
+    '999.%20%EB%B0%B1%EC%97%85')
+M4_FILE_SHARE_URL = ('https://lgeteams.sharepoint.com/:x:/r/sites/O365_379639/Shared%20Documents/'
+    'VS%ED%98%91%EB%A0%A5%EC%82%AC%EB%B3%80%EA%B2%BD%EA%B4%80%EB%A6%AC%ED%8C%80/04.%20Meeting/'
+    'VS%ED%98%91%EB%A0%A5%EC%82%AC%EB%B3%80%EA%B2%BD%EA%B4%80%EB%A6%AC%ED%8C%80%20%EC%97%85%EB%AC%B4%20%EA%B4%80%EB%A6%AC_v0.xlsx')
+GRAPH = 'https://graph.microsoft.com/v1.0'
+
+
+def _graph_token():
+    return os.environ.get('GRAPH_TOKEN') or os.environ.get('GRAPH_ACCESS_TOKEN')
+
+def _share_id(url):
+    """공유 URL → Graph /shares/{id} 용 인코딩(u! + base64url)."""
+    b = base64.urlsafe_b64encode(url.encode('utf-8')).decode('ascii').rstrip('=')
+    return 'u!' + b
+
+def _g(token, url, stream=False):
+    import requests
+    r = requests.get(url, headers={'Authorization': 'Bearer ' + token}, stream=stream, timeout=90)
+    r.raise_for_status()
+    return r
+
+def _dl_item(token, item, dest):
+    url = item.get('@microsoft.graph.downloadUrl')
+    if not url:
+        drive = item['parentReference']['driveId']
+        url = _g(token, f"{GRAPH}/drives/{drive}/items/{item['id']}").json()['@microsoft.graph.downloadUrl']
+    r = _g(token, url, stream=True)
+    with open(dest, 'wb') as f:
+        for chunk in r.iter_content(65536):
+            if chunk: f.write(chunk)
+    return dest
+
+def download_sources(outdir, token=None):
+    """팀즈 두 링크에서 최신 List 파일과 4M(업무관리) 파일을 outdir 로 내려받아 (list_path, m4_path) 반환.
+    표준 Python 으로 SharePoint 에 접속하려면 Microsoft Graph 액세스 토큰이 필요하다.
+    (환경변수 GRAPH_TOKEN). 이 Cowork 플랫폼에서는 예약 작업이 토큰 없이 자동 다운로드한다."""
+    token = token or _graph_token()
+    if not token:
+        raise RuntimeError(
+            'Graph 액세스 토큰이 없습니다. SharePoint 다운로드에는 인증이 필요합니다.\n'
+            '  · 표준 실행: 환경변수 GRAPH_TOKEN 에 Microsoft Graph 토큰을 넣고 --download 로 실행\n'
+            '  · Cowork 플랫폼: 매주 금요일 예약 작업이 자동으로 최신 파일을 받아 실행합니다.')
+    # 1) 백업 폴더 → 최신 List 파일
+    fr = _g(token, f"{GRAPH}/shares/{_share_id(BACKUP_FOLDER_SHARE_URL)}/driveItem").json()
+    drive, folder = fr['parentReference']['driveId'], fr['id']
+    kids = _g(token, f"{GRAPH}/drives/{drive}/items/{folder}/children?$top=300").json()['value']
+    cand = []
+    for k in kids:
+        m = re.search(r'_v0_(\d{6})\.xlsx$', k.get('name', ''))
+        if m and 'file' in k:
+            cand.append((m.group(1), k))
+    if not cand:
+        raise RuntimeError('백업 폴더에서 최신 List 파일(_v0_YYMMDD.xlsx)을 찾지 못했습니다.')
+    cand.sort(key=lambda x: x[0])
+    latest = cand[-1][1]
+    list_path = _dl_item(token, latest, os.path.join(outdir, latest['name']))
+    # 2) 업무관리 파일(4M Issue 보고)
+    mr = _g(token, f"{GRAPH}/shares/{_share_id(M4_FILE_SHARE_URL)}/driveItem").json()
+    m4_path = _dl_item(token, mr, os.path.join(outdir, mr['name']))
+    return list_path, m4_path
+
+
+def autofind_local(extra_dirs=None):
+    """인자 없이 실행할 때, 주변 폴더에서 최신 List 파일과 4M(업무관리) 파일을 자동 탐색.
+    반환: (list_path 또는 None, m4_path 또는 None)"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    dirs = ['.', here, os.path.join(here, 'input'), os.path.join(here, 'output'),
+            'input', 'output', 'grounding/downloads']
+    if extra_dirs:
+        dirs = list(extra_dirs) + dirs
+    seen = set(); list_cands = []; m4 = None
+    for d in dirs:
+        for p in glob.glob(os.path.join(d, '*.xlsx')):
+            ap = os.path.abspath(p)
+            if ap in seen or not os.path.isfile(p):
+                continue
+            seen.add(ap)
+            name = os.path.basename(p)
+            if '_Summary_' in name or '정기비정기' in name:    # 생성 결과물은 입력에서 제외
+                continue
+            m = re.search(r'_v0_(\d{6})\.xlsx$', name)
+            if m:
+                list_cands.append((m.group(1), p))
+            if ('업무 관리' in name) or ('업무관리' in name):
+                m4 = m4 or p
+    list_cands.sort(key=lambda x: x[0])
+    return (list_cands[-1][1] if list_cands else None), m4
 
 
 # ---------------------------------------------------------------- helpers
@@ -396,6 +511,13 @@ def build_html(A, xlsx_path, out_html, basis_date):
                      'gq': stage_tot(p, 'GQMS 접수'), 'tot': inprog[p]} for p in people],
                    key=lambda x: -x['tot'])
     CHART_JSON = json.dumps(chart, ensure_ascii=False)
+
+    # 정기/비정기 상태별 진행중 건수 (심의회+QA+GQMS 합산) — periods 순서 유지
+    inprog_stages = [s for s in stages if s in BREAKDOWN_STAGES]
+    period_chart = [{'label': pv,
+                     'value': sum(per_val(p, s, pv) for p in people for s in inprog_stages),
+                     'color': PERIOD_COLORS.get(pv, PERIOD_COLOR_DEFAULT)} for pv in periods]
+    PERIOD_JSON = json.dumps(period_chart, ensure_ascii=False)
     LISTDATA = json.dumps({'listHeader': lh, 'list': ld, 'm4Header': m4h, 'm4': m4}, ensure_ascii=False)
 
     DL = (f'<a class="dl" download="{html.escape(xname)}" '
@@ -403,7 +525,7 @@ def build_html(A, xlsx_path, out_html, basis_date):
 
     page = HTML_TMPL.format(CSS=CSS, basis=html.escape(basis_date), DL=DL, kpihtml=kpihtml,
                             HOME_TBL=HOME_TBL, FULL_TBL=FULL_TBL,
-                            LISTDATA=LISTDATA, CHART_JSON=CHART_JSON, JS=JS)
+                            LISTDATA=LISTDATA, CHART_JSON=CHART_JSON, PERIOD_JSON=PERIOD_JSON, JS=JS)
     open(out_html, 'w', encoding='utf-8').write(page)
     return out_html
 
@@ -465,6 +587,16 @@ tbody tr:hover .rowname{background:var(--soft)}
 .brow .vl{font-size:11px;color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
 .legend{display:flex;gap:16px;padding:4px 18px 0;font-size:12px;color:var(--muted);flex-wrap:wrap}
 .legend span{display:inline-flex;align-items:center;gap:6px}.legend i{width:11px;height:11px;border-radius:3px;display:inline-block}
+.pchart{padding:12px 18px 18px}
+.prow{display:grid;grid-template-columns:120px 1fr 96px;align-items:center;gap:12px;margin:9px 0}
+.prow .pnm{font-size:12.5px;font-weight:700;white-space:nowrap}
+.ptrack{background:rgba(0,0,0,.05);border-radius:8px;height:22px;overflow:hidden}
+.pfill{height:100%;border-radius:8px;min-width:2px;cursor:pointer;transition:filter .12s}
+.pfill:hover{filter:brightness(1.08) saturate(1.1)}
+.prow .pvl{font-size:12px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted);font-weight:700}
+.tip{position:fixed;pointer-events:none;background:#1d1d1f;color:#fff;padding:6px 10px;border-radius:8px;
+font-size:12px;font-weight:600;line-height:1.35;z-index:999;box-shadow:0 4px 16px rgba(0,0,0,.25);max-width:240px}
+.tip b{color:#ffd2dd}
 .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
 .inp{flex:1;min-width:200px;display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:11px;padding:9px 13px;box-shadow:var(--shadow)}
 .inp input{border:0;outline:0;background:transparent;color:var(--ink);font-size:13.5px;width:100%}
@@ -498,6 +630,12 @@ const RAW=JSON.parse(document.getElementById('ldata').textContent);
 const CHART=JSON.parse(document.getElementById('cdata').textContent);
 const $=(s,e=document)=>e.querySelector(s),$$=(s,e=document)=>[...e.querySelectorAll(s)];
 function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+// 마우스 호버 툴팁(수치 표시)
+const TIP=document.createElement('div');TIP.className='tip';TIP.style.display='none';document.body.appendChild(TIP);
+function bindTips(){$$('.hastip').forEach(el=>{ if(el._tb)return; el._tb=1;
+  el.addEventListener('mouseenter',()=>{TIP.innerHTML=el.dataset.tip;TIP.style.display='block';});
+  el.addEventListener('mousemove',e=>{TIP.style.left=Math.min(e.clientX+14,window.innerWidth-250)+'px';TIP.style.top=(e.clientY+16)+'px';});
+  el.addEventListener('mouseleave',()=>{TIP.style.display='none';});});}
 $$('nav.menu button').forEach(b=>b.addEventListener('click',()=>{
   $$('nav.menu button').forEach(x=>x.classList.remove('active'));b.classList.add('active');
   $$('.page').forEach(p=>p.classList.remove('show'));$('#'+b.dataset.t).classList.add('show');
@@ -507,12 +645,22 @@ $('#dlhtml').addEventListener('click',()=>{
   const bl=new Blob([h],{type:'text/html;charset=utf-8'});const a=document.createElement('a');
   a.href=URL.createObjectURL(bl);a.download='부품4M_변경관리_현황.html';document.body.appendChild(a);a.click();
   a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1500);});
+// 정기/비정기 상태별 진행중 그래프 (지정 색상 + 호버 수치)
+(function(){const P=JSON.parse(document.getElementById('pdata').textContent);
+ const tot=P.reduce((s,d)=>s+d.value,0)||1;const mx=Math.max(1,...P.map(d=>d.value));
+ $('#pchart').innerHTML=P.map(d=>{const pct=(d.value/tot*100);
+  return `<div class="prow"><div class="pnm">${esc(d.label)}</div>
+   <div class="ptrack"><div class="pfill hastip" style="width:${(d.value/mx*100).toFixed(1)}%;background:${d.color}" data-tip="<b>${esc(d.label)}</b><br>${d.value.toLocaleString()}건 · 진행중의 ${pct.toFixed(1)}%"></div></div>
+   <div class="pvl">${d.value.toLocaleString()}건</div></div>`;}).join('');
+ bindTips();})();
+// 담당자별 진행중 구성 (세그먼트 호버 수치)
 (function(){const mx=Math.max(1,...CHART.map(c=>c.tot));
  $('#chart').innerHTML=CHART.map(c=>{const w=c.tot/mx*100;const t=c.tot||1;
-  const seg=(v,col)=>v?`<i style="width:${v/t*100}%;background:${col}"></i>`:'';
+  const seg=(v,col,nm)=>v?`<i class="hastip" style="width:${v/t*100}%;background:${col}" data-tip="<b>${esc(c.nm)} · ${nm}</b><br>${v.toLocaleString()}건"></i>`:'';
   return `<div class="brow"><div class="nm">${esc(c.nm)}</div>
-   <div class="stack" style="width:${w}%;min-width:2px">${seg(c.sim,'var(--sim)')}${seg(c.qa,'var(--qa)')}${seg(c.gq,'var(--gq)')}</div>
-   <div class="vl">계 ${c.tot.toLocaleString()} (심${c.sim}/QA${c.qa}/GQ${c.gq})</div></div>`;}).join('');})();
+   <div class="stack" style="width:${w}%;min-width:2px">${seg(c.sim,'var(--sim)','심의회')}${seg(c.qa,'var(--qa)','QA 인정 시험')}${seg(c.gq,'var(--gq)','GQMS 접수')}</div>
+   <div class="vl">계 ${c.tot.toLocaleString()} (심${c.sim}/QA${c.qa}/GQ${c.gq})</div></div>`;}).join('');
+ bindTips();})();
 (function(){let page=1,per=50,q='',si=-1,sa=true;
  const head=$('#lhead'),body=$('#lbody'),pg=$('#lpager'),H=RAW.listHeader;
  function rows(){let r=RAW.list;if(q){const t=q.toLowerCase();r=r.filter(x=>x.some(c=>String(c).toLowerCase().includes(t)));}
@@ -567,6 +715,9 @@ HTML_TMPL = """<!doctype html><html lang="ko" dir="ltr"><head>
 <h1 class="pt">진행중 현황 (홈)</h1>
 <div class="sub">심의회·QA 인정 시험·GQMS 접수 단계와 정기/비정기 분해 중심 요약 · 4M 완료·Reject·4M 완료(C)·합계 열 제외</div>
 <div class="kpis">{kpihtml}</div>
+<div class="card"><h3><span class="b3"></span>정기/비정기 상태별 진행중 현황</h3>
+<div class="sub" style="padding:8px 18px 0;margin:0">심의회·QA 인정 시험·GQMS 접수 합산 · 막대에 마우스를 올리면 수치가 표시됩니다</div>
+<div class="pchart" id="pchart"></div></div>
 <div class="card"><h3><span class="b3"></span>담당자별 진행중 구성 (심의회·QA·GQMS)</h3>
 <div class="legend"><span><i style="background:var(--sim)"></i>심의회</span><span><i style="background:var(--qa)"></i>QA 인정 시험</span><span><i style="background:var(--gq)"></i>GQMS 접수</span></div>
 <div class="chart" id="chart"></div></div>
@@ -598,6 +749,7 @@ HTML_TMPL = """<!doctype html><html lang="ko" dir="ltr"><head>
 <footer>팀즈 백업 최신 파일 기준 · 매주 금요일 자동 갱신 · 홈(진행중)·Summary(전체)·List·4M Issue 보고 · 상단에서 HTML/원본 엑셀 다운로드</footer>
 <script id="ldata" type="application/json">{LISTDATA}</script>
 <script id="cdata" type="application/json">{CHART_JSON}</script>
+<script id="pdata" type="application/json">{PERIOD_JSON}</script>
 <script>{JS}</script></body></html>"""
 
 
@@ -623,13 +775,52 @@ def copy_m4_sheet(dst_wb, src_ws, name='4M_Issue_보고'):
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description='부품 4M 변경관리 홈페이지 자동 생성')
-    ap.add_argument('input', help='List/Summary 입력 엑셀 (팀즈 999.백업 최신 파일)')
+    ap.add_argument('input', nargs='?', default=None,
+                    help='List/Summary 입력 엑셀 (팀즈 999.백업 최신 파일). --download 시 생략 가능')
     ap.add_argument('--m4-file', default=None,
                     help='4M Issue 보고 시트를 가진 별도 엑셀 (예: VS협력사변경관리팀 업무 관리_v0.xlsx). '
                          '생략 시 input 안의 4M 시트를 사용')
+    ap.add_argument('--download', action='store_true',
+                    help='팀즈 공유 링크에서 최신 List 파일과 4M(업무관리) 파일을 직접 내려받아 사용 '
+                         '(Microsoft Graph 토큰 필요: 환경변수 GRAPH_TOKEN)')
     ap.add_argument('--outdir', default='output')
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
+
+    # 인자 없이 실행한 경우: 토큰이 있으면 팀즈 다운로드, 없으면 주변 폴더의 원본 자동 사용
+    if not a.input and not a.download:
+        if _graph_token():
+            a.download = True
+        else:
+            li, m4 = autofind_local([a.outdir])
+            if li:
+                a.input = li
+                if m4 and not a.m4_file:
+                    a.m4_file = m4
+                print('입력 자동 선택(로컬 폴더에서 발견):')
+                print('  · List :', a.input)
+                print('  · 4M   :', a.m4_file or '(input 내 시트 사용)')
+            else:
+                print('실행할 입력을 찾지 못했습니다. 아래 중 하나로 실행하세요:')
+                print('  1) 팀즈 자동 다운로드 : 환경변수 GRAPH_TOKEN 설정 후 다시 실행')
+                print('                         (또는  python refresh_4m_homepage.py --download )')
+                print('  2) 로컬 파일 지정     : python refresh_4m_homepage.py "<List.xlsx>" --m4-file "<업무관리.xlsx>"')
+                print('  3) 같은 폴더에 원본 .xlsx 를 두고 다시 실행')
+                print('     (예: Supplier Parts Change Management_v0_YYMMDD.xlsx, VS협력사변경관리팀 업무 관리_v0.xlsx)')
+                sys.exit(1)
+
+    # --download: 팀즈에서 최신 List/4M 파일을 직접 내려받아 input/m4_file 로 사용
+    if a.download:
+        try:
+            a.input, a.m4_file = download_sources(a.outdir)
+        except Exception as e:
+            print('[다운로드 실패]', e)
+            sys.exit(1)
+        print('다운로드 완료:')
+        print('  · List 최신 :', a.input)
+        print('  · 4M 파일   :', a.m4_file)
+    if not a.input:
+        ap.error('입력 엑셀이 필요합니다. (--download 또는 입력 파일 경로)')
 
     basis = date_from_name(a.input)
 
@@ -661,7 +852,23 @@ def main():
     html_out = os.path.join(a.outdir, '부품4M_변경관리_현황.html')
     build_html(A, xlsx_out, html_out, basis)
 
+    # 참고한 최신 원본 파일(List, 4M)을 outdir 에도 보존 → 함께 다운로드 가능
+    import shutil
+    saved_src = []
+    for src in [a.input, a.m4_file]:
+        if not src:
+            continue
+        dst = os.path.join(a.outdir, os.path.basename(src))
+        if os.path.abspath(src) != os.path.abspath(dst):
+            try:
+                shutil.copy2(src, dst); saved_src.append(dst)
+            except Exception as e:
+                print('원본 보존 실패:', src, e)
+        else:
+            saved_src.append(dst)
+
     print('기준일      :', basis)
+    print('원본 보존   :', [os.path.basename(p) for p in saved_src])
     print('4M 출처     :', a.m4_file or '(input 내 시트)')
     print('담당자      :', len(A['people']), '명', A['people'])
     print('진행 단계   :', A['stages'])
